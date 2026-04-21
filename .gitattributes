@@ -1,0 +1,45 @@
+# Auto detect text files and normalize line endings to LF
+* text=auto
+
+# Python files
+*.py text eol=lf
+*.pyc binary
+*.pyo binary
+*.egg-info/ binary
+
+# Documents
+*.md text eol=lf
+*.txt text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.csv text eol=lf
+
+# Binary files
+*.pdf binary
+*.exe binary
+*.jar binary
+*.xlsx binary
+*.xls binary
+*.pptx binary
+*.ppt binary
+
+# Audio/Video
+*.mp3 binary
+*.wav binary
+*.m4a binary
+*.ogg binary
+*.mp4 binary
+
+# Images
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+
+# Archives
+*.zip binary
+*.tar binary
+*.gz binary
+*.rar binary
