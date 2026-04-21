@@ -49,6 +49,8 @@ venv.bak/
 .env.*.local
 .env.production
 .env.development
+.m4a
+*.m4a
 
 # Temporary files
 temp_audio/
