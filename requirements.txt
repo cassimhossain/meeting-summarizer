@@ -1,5 +1,9 @@
-# openai-whisper
-# groq
-# streamlit
-# reportlab
-# python-dotenv
+openai-whisper
+groq
+streamlit
+reportlab
+python-dotenv
+torch
+torchvision
+torchaudio
+numpy
