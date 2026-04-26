@@ -86,4 +86,10 @@ htmlcov/
 # Build
 dist/
 build/
-*.egg-info/
+*.egg-info/"" 
+"# Fonts (downloaded separately by users)" 
+"fonts/*.ttf" 
+"" 
+"# Generated outputs" 
+"output/" 
+"temp_audio/" 
