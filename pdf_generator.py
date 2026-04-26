@@ -1,508 +1,580 @@
 """
-pdf_report.py  –  Structured summary dict → polished PDF report (ReportLab)
-Improvements over v1:
-  • Stats summary bar (action items, decisions, risks, attendees)
-  • Color-coded priority badges in action items table
-  • Sentiment indicator in header
-  • Risks section with likelihood color coding
-  • Speaker contributions section
-  • Page numbers in footer via canvas callback
-  • Meeting type badge in header
-  • Visual section dividers with icons (unicode)
-  • Context column in action items
-  • Impact column in decisions
+pdf_generator.py — Bilingual PDF report generator (English + Urdu)
+
+Features:
+• Professional styling with section dividers, color accents, and clear hierarchy
+• Full Urdu (RTL) support via arabic-reshaper + python-bidi
+• Auto-detects whether to use LTR or RTL layout based on summary['_output_language']
+• 'Both' mode: prints English first, then a parallel Urdu section
+• Urdu font (Noto Nastaliq) with graceful fallback to system default if missing
+• Color-coded priority badges for action items
+• Clean tables for action items, decisions, and risks
+• Page numbers and metadata footer
 """
 
 from __future__ import annotations
 
-import io
+import os
 from datetime import datetime
 from typing import Any
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.units import mm
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer, Table,
+    TableStyle, PageBreak, HRFlowable, KeepTogether,
 )
 
-# ── Brand palette ──────────────────────────────────────────────────────────
-NAVY    = colors.HexColor("#0F2044")
-BLUE    = colors.HexColor("#1D4ED8")
-LBLUE   = colors.HexColor("#EFF6FF")
-DBLUE   = colors.HexColor("#1E3A8A")
-MGREY   = colors.HexColor("#64748B")
-LGREY   = colors.HexColor("#F8FAFC")
-DGREY   = colors.HexColor("#334155")
-BORDER  = colors.HexColor("#CBD5E1")
+# Optional Urdu shaping libraries
+try:
+    import arabic_reshaper
+    from bidi.algorithm import get_display
+    _URDU_LIBS_OK = True
+except ImportError:
+    _URDU_LIBS_OK = False
+    print("[pdf] WARNING: arabic-reshaper / python-bidi not installed. "
+          "Urdu output will not render correctly. "
+          "Run: pip install arabic-reshaper python-bidi")
 
-GREEN   = colors.HexColor("#15803D")
-LGREEN  = colors.HexColor("#DCFCE7")
-AMBER   = colors.HexColor("#B45309")
-LAMBER  = colors.HexColor("#FEF3C7")
-RED     = colors.HexColor("#B91C1C")
-LRED    = colors.HexColor("#FEE2E2")
-PURPLE  = colors.HexColor("#6D28D9")
-LPURPLE = colors.HexColor("#EDE9FE")
-TEAL    = colors.HexColor("#0F766E")
-LTEAL   = colors.HexColor("#CCFBF1")
 
-# Priority → (text color, background)
-PRIORITY_COLORS: dict[str, tuple] = {
-    "high":   (RED,    LRED),
-    "medium": (AMBER,  LAMBER),
-    "low":    (GREEN,  LGREEN),
+# ── Theme ──────────────────────────────────────────────────────────────────
+
+PRIMARY = colors.HexColor("#1E40AF")        # deep blue
+ACCENT = colors.HexColor("#0EA5E9")         # sky blue
+DARK = colors.HexColor("#1F2937")           # near-black
+MUTED = colors.HexColor("#6B7280")          # gray
+LIGHT_BG = colors.HexColor("#F3F4F6")       # very light gray
+SUCCESS = colors.HexColor("#10B981")        # green
+WARNING = colors.HexColor("#F59E0B")        # amber
+DANGER = colors.HexColor("#EF4444")         # red
+
+PRIORITY_COLORS = {
+    "High": DANGER,
+    "Medium": WARNING,
+    "Low": SUCCESS,
 }
 
-# Sentiment → badge color
-SENTIMENT_COLORS: dict[str, tuple] = {
-    "positive":   (GREEN,  LGREEN),
-    "neutral":    (MGREY,  LGREY),
-    "mixed":      (AMBER,  LAMBER),
-    "tense":      (RED,    LRED),
-    "unresolved": (PURPLE, LPURPLE),
-}
+# ── Font registration ──────────────────────────────────────────────────────
 
-# Likelihood → color
-LIKELIHOOD_COLORS: dict[str, tuple] = {
-    "high":    (RED,    LRED),
-    "medium":  (AMBER,  LAMBER),
-    "low":     (GREEN,  LGREEN),
-    "unknown": (MGREY,  LGREY),
-}
-
-# Meeting type → friendly label
-MEETING_TYPE_LABELS: dict[str, str] = {
-    "standup":      "Stand-up",
-    "planning":     "Planning",
-    "retrospective":"Retrospective",
-    "review":       "Review",
-    "brainstorm":   "Brainstorm",
-    "1-on-1":       "1-on-1",
-    "all-hands":    "All Hands",
-    "client-call":  "Client Call",
-    "interview":    "Interview",
-    "other":        "Meeting",
-}
-
-PAGE_W, PAGE_H = A4
-LEFT_M = RIGHT_M = 22 * mm
-TOP_M = BOTTOM_M = 20 * mm
-CONTENT_W = PAGE_W - LEFT_M - RIGHT_M
+URDU_FONT_NAME = "NotoNastaliq"
+URDU_FONT_REGISTERED = False
 
 
-# ── Style factory ──────────────────────────────────────────────────────────
+def _register_urdu_font() -> bool:
+    """
+    Try to register the Urdu font from common locations. Returns True if
+    successfully registered. Falls back to Helvetica if not found, which
+    will render Urdu as boxes — but at least the PDF won't crash.
+    """
+    global URDU_FONT_REGISTERED
+    if URDU_FONT_REGISTERED:
+        return True
 
-def _styles() -> dict[str, ParagraphStyle]:
-    def s(name, **kw) -> ParagraphStyle:
-        defaults = dict(fontName="Helvetica", fontSize=10,
-                        textColor=DGREY, leading=14)
-        defaults.update(kw)
-        return ParagraphStyle(name, **defaults)
+    candidates = [
+        "fonts/NotoNastaliqUrdu-Regular.ttf",
+        "fonts/NotoNastaliqUrdu.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Regular.ttf",
+        "/Library/Fonts/NotoNastaliqUrdu-Regular.ttf",
+        os.path.expanduser("~/.fonts/NotoNastaliqUrdu-Regular.ttf"),
+    ]
 
-    return {
-        "title":    s("title",   fontSize=22, fontName="Helvetica-Bold",
-                       textColor=NAVY, spaceAfter=4, leading=26),
-        "subtitle": s("sub",     fontSize=10, textColor=MGREY, spaceAfter=2),
-        "section":  s("section", fontSize=13, fontName="Helvetica-Bold",
-                       textColor=NAVY, spaceBefore=16, spaceAfter=8),
-        "body":     s("body",    fontSize=10, spaceAfter=4, leading=15),
-        "item":     s("item",    fontSize=10, spaceAfter=3, leading=13,
-                       leftIndent=10),
-        "small":    s("small",   fontSize=8,  textColor=MGREY, leading=11),
-        "badge":    s("badge",   fontSize=8,  fontName="Helvetica-Bold",
-                       alignment=TA_CENTER, leading=10),
-        "th":       s("th",      fontSize=9,  fontName="Helvetica-Bold",
-                       textColor=colors.white, alignment=TA_LEFT, leading=12),
-        "td":       s("td",      fontSize=9,  leading=12, spaceAfter=0),
-        "stat_num": s("stat_n",  fontSize=20, fontName="Helvetica-Bold",
-                       textColor=NAVY, alignment=TA_CENTER, leading=22),
-        "stat_lbl": s("stat_l",  fontSize=8,  textColor=MGREY,
-                       alignment=TA_CENTER, leading=10),
-        "footer":   s("footer",  fontSize=8,  textColor=MGREY,
-                       alignment=TA_CENTER),
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont(URDU_FONT_NAME, path))
+                URDU_FONT_REGISTERED = True
+                print(f"[pdf] Registered Urdu font: {path}")
+                return True
+            except Exception as e:
+                print(f"[pdf] Failed to register {path}: {e}")
+
+    print("[pdf] WARNING: No Urdu font found. Urdu text may render as boxes.")
+    print("[pdf] Download from: https://fonts.google.com/noto/specimen/Noto+Nastaliq+Urdu")
+    print("[pdf] Place in ./fonts/NotoNastaliqUrdu-Regular.ttf")
+    return False
+
+
+# ── Urdu shaping helper ────────────────────────────────────────────────────
+
+def _shape_urdu(text: str) -> str:
+    """Reshape Urdu text and apply BiDi algorithm for correct rendering."""
+    if not text or not _URDU_LIBS_OK:
+        return text or ""
+    try:
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    except Exception:
+        return text
+
+
+def _has_urdu_chars(text: str) -> bool:
+    """Check if string contains any Urdu/Arabic Unicode range characters."""
+    if not text:
+        return False
+    return any("\u0600" <= ch <= "\u06FF" for ch in text)
+
+
+# ── Style sheet ────────────────────────────────────────────────────────────
+
+def _build_styles() -> dict[str, ParagraphStyle]:
+    """Build the full set of paragraph styles used across the report."""
+    base = getSampleStyleSheet()
+    urdu_font = URDU_FONT_NAME if URDU_FONT_REGISTERED else "Helvetica"
+
+    styles = {
+        # Cover / title
+        "Title": ParagraphStyle(
+            "Title", parent=base["Title"],
+            fontName="Helvetica-Bold", fontSize=26, leading=32,
+            textColor=PRIMARY, alignment=TA_LEFT, spaceAfter=4,
+        ),
+        "Subtitle": ParagraphStyle(
+            "Subtitle", parent=base["Normal"],
+            fontName="Helvetica", fontSize=11, leading=14,
+            textColor=MUTED, alignment=TA_LEFT, spaceAfter=12,
+        ),
+
+        # Section heading
+        "H1": ParagraphStyle(
+            "H1", parent=base["Heading1"],
+            fontName="Helvetica-Bold", fontSize=15, leading=20,
+            textColor=PRIMARY, alignment=TA_LEFT,
+            spaceBefore=14, spaceAfter=6,
+        ),
+        "H2": ParagraphStyle(
+            "H2", parent=base["Heading2"],
+            fontName="Helvetica-Bold", fontSize=12, leading=15,
+            textColor=DARK, alignment=TA_LEFT,
+            spaceBefore=8, spaceAfter=4,
+        ),
+
+        # Body
+        "Body": ParagraphStyle(
+            "Body", parent=base["Normal"],
+            fontName="Helvetica", fontSize=10.5, leading=15,
+            textColor=DARK, alignment=TA_JUSTIFY, spaceAfter=6,
+        ),
+        "Bullet": ParagraphStyle(
+            "Bullet", parent=base["Normal"],
+            fontName="Helvetica", fontSize=10.5, leading=14,
+            textColor=DARK, leftIndent=14, bulletIndent=4, spaceAfter=3,
+        ),
+        "Meta": ParagraphStyle(
+            "Meta", parent=base["Normal"],
+            fontName="Helvetica-Oblique", fontSize=9, leading=12,
+            textColor=MUTED, alignment=TA_LEFT,
+        ),
+
+        # Urdu (RTL)
+        "UrduTitle": ParagraphStyle(
+            "UrduTitle", parent=base["Title"],
+            fontName=urdu_font, fontSize=22, leading=34,
+            textColor=PRIMARY, alignment=TA_RIGHT, spaceAfter=4,
+            wordWrap="RTL",
+        ),
+        "UrduH1": ParagraphStyle(
+            "UrduH1", parent=base["Heading1"],
+            fontName=urdu_font, fontSize=14, leading=24,
+            textColor=PRIMARY, alignment=TA_RIGHT,
+            spaceBefore=14, spaceAfter=6, wordWrap="RTL",
+        ),
+        "UrduBody": ParagraphStyle(
+            "UrduBody", parent=base["Normal"],
+            fontName=urdu_font, fontSize=11, leading=22,
+            textColor=DARK, alignment=TA_RIGHT,
+            spaceAfter=6, wordWrap="RTL",
+        ),
+        "UrduBullet": ParagraphStyle(
+            "UrduBullet", parent=base["Normal"],
+            fontName=urdu_font, fontSize=11, leading=20,
+            textColor=DARK, alignment=TA_RIGHT,
+            rightIndent=14, spaceAfter=3, wordWrap="RTL",
+        ),
     }
+    return styles
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Page decoration (header / footer) ──────────────────────────────────────
 
-def _priority_badge(priority: str, badge_style: ParagraphStyle) -> Table:
-    """Render a colored pill for High / Medium / Low."""
-    key = priority.lower()
-    fg, bg = PRIORITY_COLORS.get(key, (MGREY, LGREY))
-    cell = Paragraph(f"<font color='#{_hex(fg)}'><b>{priority.title()}</b></font>",
-                     badge_style)
-    tbl = Table([[cell]], colWidths=[18 * mm])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), bg),
-        ("ROUNDEDCORNERS", [3]),
-        ("TOPPADDING",   (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+def _draw_page_chrome(canvas, doc):
+    """Draw header bar and footer (page number + generated timestamp)."""
+    canvas.saveState()
+
+    # Top accent bar
+    canvas.setFillColor(PRIMARY)
+    canvas.rect(0, A4[1] - 0.4 * cm, A4[0], 0.4 * cm, fill=1, stroke=0)
+
+    # Footer line
+    canvas.setStrokeColor(LIGHT_BG)
+    canvas.setLineWidth(0.5)
+    canvas.line(2 * cm, 1.5 * cm, A4[0] - 2 * cm, 1.5 * cm)
+
+    # Footer text
+    canvas.setFont("Helvetica", 8)
+    canvas.setFillColor(MUTED)
+    canvas.drawString(2 * cm, 1.0 * cm,
+                      f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    canvas.drawRightString(A4[0] - 2 * cm, 1.0 * cm, f"Page {doc.page}")
+    canvas.drawCentredString(A4[0] / 2, 1.0 * cm, "Meeting Summarizer")
+
+    canvas.restoreState()
+
+
+# ── Section builders ──────────────────────────────────────────────────────
+
+def _kv_table(rows: list[tuple[str, str]]) -> Table:
+    """Compact key-value metadata table (left-aligned)."""
+    t = Table(rows, colWidths=[3.5 * cm, 13 * cm], hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TEXTCOLOR", (0, 0), (0, -1), PRIMARY),
+        ("TEXTCOLOR", (1, 0), (1, -1), DARK),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
-    return tbl
+    return t
 
 
-def _likelihood_badge(likelihood: str, badge_style: ParagraphStyle) -> Table:
-    key = likelihood.lower()
-    fg, bg = LIKELIHOOD_COLORS.get(key, (MGREY, LGREY))
-    cell = Paragraph(f"<font color='#{_hex(fg)}'><b>{likelihood.title()}</b></font>",
-                     badge_style)
-    tbl = Table([[cell]], colWidths=[18 * mm])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), bg),
-        ("TOPPADDING",   (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-    ]))
-    return tbl
-
-
-def _hex(c: colors.Color) -> str:
-    """Return 6-char hex string for a ReportLab color (no '#')."""
-    r, g, b = int(c.red * 255), int(c.green * 255), int(c.blue * 255)
-    return f"{r:02X}{g:02X}{b:02X}"
-
-
-def _section(title: str, icon: str, st: dict) -> list:
-    """Section header with icon prefix and a thin rule."""
-    return [
-        Paragraph(f"{icon}  {title}", st["section"]),
-        HRFlowable(width="100%", thickness=0.6, color=BORDER, spaceAfter=6),
+def _stats_strip(stats: dict, attendees: int) -> Table:
+    """Five-cell colored strip showing meeting statistics."""
+    cells = [
+        [str(attendees), str(stats.get("action_item_count", 0)),
+         str(stats.get("decision_count", 0)),
+         str(stats.get("open_question_count", 0)),
+         str(stats.get("risk_count", 0))],
+        ["Attendees", "Action Items", "Decisions", "Open Qs", "Risks"],
     ]
+    t = Table(cells, colWidths=[3.4 * cm] * 5, rowHeights=[0.9 * cm, 0.6 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
+        ("BACKGROUND", (0, 1), (-1, 1), LIGHT_BG),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("TEXTCOLOR", (0, 1), (-1, 1), MUTED),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, 1), (-1, 1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, 0), 18),
+        ("FONTSIZE", (0, 1), (-1, 1), 9),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.white),
+    ]))
+    return t
 
 
-def _table_base_style() -> list:
-    return [
-        ("BACKGROUND",    (0, 0), (-1, 0), NAVY),
-        ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
-        ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, -1), 9),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, LGREY]),
-        ("GRID",          (0, 0), (-1, -1), 0.4, BORDER),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 7),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 7),
-        ("TOPPADDING",    (0, 0), (-1, -1), 6),
+def _action_items_table(items: list[dict], styles: dict) -> Table | None:
+    if not items:
+        return None
+    header = ["Task", "Owner", "Due", "Priority"]
+    rows = [header]
+    for item in items:
+        priority = item.get("priority", "Medium")
+        rows.append([
+            Paragraph(item.get("task", ""), styles["Body"]),
+            item.get("owner", "Unassigned"),
+            item.get("due_date", "—"),
+            priority,
+        ])
+
+    t = Table(rows, colWidths=[8 * cm, 3.5 * cm, 3 * cm, 2 * cm],
+              repeatRows=1, hAlign="LEFT")
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), PRIMARY),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("FONTSIZE", (0, 1), (-1, -1), 9.5),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("VALIGN",        (0, 0), (-1, -1), "TOP"),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.white, LGREY]),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_BG]),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, PRIMARY),
+        ("ALIGN", (3, 1), (3, -1), "CENTER"),
     ]
+    # Color-code priority cells
+    for i, item in enumerate(items, start=1):
+        color = PRIORITY_COLORS.get(item.get("priority", "Medium"), MUTED)
+        style.append(("TEXTCOLOR", (3, i), (3, i), color))
+        style.append(("FONTNAME", (3, i), (3, i), "Helvetica-Bold"))
+    t.setStyle(TableStyle(style))
+    return t
 
 
-# ── Page number footer ─────────────────────────────────────────────────────
-
-def _make_footer(doc_title: str):
-    """Returns an onPage callback that draws a footer on every page."""
-    def _footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillColor(MGREY)
-        page_num = f"Page {doc.page}"
-        canvas.drawString(LEFT_M, BOTTOM_M - 8, doc_title)
-        canvas.drawRightString(PAGE_W - RIGHT_M, BOTTOM_M - 8, page_num)
-        canvas.restoreState()
-    return _footer
-
-
-# ── Stats bar ─────────────────────────────────────────────────────────────
-
-def _build_stats_bar(stats: dict, st: dict) -> Table:
-    """4-cell summary bar: action items | decisions | open questions | risks."""
-    def cell(n: int, label: str) -> list:
-        return [
-            Paragraph(str(n), st["stat_num"]),
-            Paragraph(label,  st["stat_lbl"]),
-        ]
-
-    data = [[
-        cell(stats.get("action_item_count", 0),   "Action Items"),
-        cell(stats.get("decision_count", 0),       "Decisions"),
-        cell(stats.get("open_question_count", 0),  "Open Questions"),
-        cell(stats.get("risk_count", 0),           "Risks"),
-    ]]
-    col_w = CONTENT_W / 4
-    tbl = Table(data, colWidths=[col_w] * 4, rowHeights=[46])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), LBLUE),
-        ("BOX",          (0, 0), (-1, -1), 0.5, BLUE),
-        ("LINEBEFORE",   (1, 0), (3, 0), 0.5, BLUE),
-        ("VALIGN",       (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",   (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 6),
-    ]))
-    return tbl
+def _decisions_block(decisions: list[dict], styles: dict) -> list:
+    out = []
+    for d in decisions:
+        out.append(Paragraph(f"<b>•</b> {d.get('decision', '')}", styles["Bullet"]))
+        rationale = d.get("rationale") or "—"
+        decided_by = d.get("decided_by") or "—"
+        out.append(Paragraph(
+            f"<font color='#6B7280'>Rationale: {rationale} &nbsp;|&nbsp; "
+            f"Decided by: {decided_by}</font>",
+            styles["Meta"],
+        ))
+        out.append(Spacer(1, 4))
+    return out
 
 
-# ── Header badge (sentiment + meeting type) ────────────────────────────────
-
-def _build_header_badges(meeting_type: str, sentiment: str,
-                         duration: str, st: dict) -> Table:
-    type_label = MEETING_TYPE_LABELS.get(meeting_type.lower(), "Meeting")
-    s_fg, s_bg = SENTIMENT_COLORS.get(sentiment.lower(), (MGREY, LGREY))
-
-    type_cell = Paragraph(
-        f"<font color='#{_hex(BLUE)}'><b>{type_label}</b></font>",
-        st["badge"])
-    sent_cell = Paragraph(
-        f"<font color='#{_hex(s_fg)}'><b>{sentiment.title()}</b></font>",
-        st["badge"])
-    dur_cell  = Paragraph(
-        f"<font color='#{_hex(MGREY)}'>{duration}</font>",
-        st["badge"])
-
-    type_tbl = Table([[type_cell]], colWidths=[22 * mm])
-    type_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), LBLUE),
-        ("BOX",          (0, 0), (-1, -1), 0.5, BLUE),
-        ("TOPPADDING",   (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    sent_tbl = Table([[sent_cell]], colWidths=[22 * mm])
-    sent_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), s_bg),
-        ("BOX",          (0, 0), (-1, -1), 0.5, s_fg),
-        ("TOPPADDING",   (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-    ]))
-    dur_tbl = Table([[dur_cell]], colWidths=[22 * mm])
-    dur_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0, 0), (-1, -1), LGREY),
-        ("BOX",          (0, 0), (-1, -1), 0.5, BORDER),
-        ("TOPPADDING",   (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 2),
-        ("LEFTPADDING",  (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-    ]))
-
-    row = Table([[type_tbl, sent_tbl, dur_tbl, ""]], 
-                colWidths=[26*mm, 28*mm, 32*mm, CONTENT_W - 86*mm])
-    row.setStyle(TableStyle([
-        ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING",(0, 0), (-1, -1), 4),
-        ("TOPPADDING",  (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING",(0, 0), (-1, -1), 0),
-    ]))
-    return row
+def _risks_block(risks: list[dict], styles: dict) -> list:
+    out = []
+    for r in risks:
+        likelihood = r.get("likelihood", "Unknown")
+        color = PRIORITY_COLORS.get(likelihood, MUTED).hexval()[2:]
+        out.append(Paragraph(
+            f"<b>•</b> {r.get('risk', '')} "
+            f"<font color='#{color}'><b>[{likelihood}]</b></font>",
+            styles["Bullet"],
+        ))
+        mitigation = r.get("mitigation") or "None discussed"
+        out.append(Paragraph(
+            f"<font color='#6B7280'>Mitigation: {mitigation}</font>",
+            styles["Meta"],
+        ))
+        out.append(Spacer(1, 4))
+    return out
 
 
-# ── Main generator ────────────────────────────────────────────────────────
+def _bullet_list(items: list[str], styles: dict) -> list:
+    return [Paragraph(f"• {it}", styles["Bullet"]) for it in items]
 
-def generate_pdf_report(summary: dict[str, Any],
-                        meeting_date: str | None = None) -> bytes:
-    """
-    Generate a polished PDF report from the structured summary dict.
 
-    Args:
-        summary:      Output of summarize_transcript().
-        meeting_date: Optional date string to show in the header.
+def _urdu_bullet_list(items: list[str], styles: dict) -> list:
+    return [Paragraph(_shape_urdu(f"• {it}"), styles["UrduBullet"]) for it in items]
 
-    Returns:
-        Raw PDF bytes suitable for st.download_button or file I/O.
-    """
-    buffer = io.BytesIO()
-    title  = summary.get("meeting_title", "Meeting Summary")
-    footer = _make_footer(title)
 
-    doc = SimpleDocTemplate(
-        buffer, pagesize=A4,
-        rightMargin=RIGHT_M, leftMargin=LEFT_M,
-        topMargin=TOP_M, bottomMargin=BOTTOM_M + 8,
-        title=title,
-        author="AI Meeting Summarizer",
-    )
+# ── Section: English content ──────────────────────────────────────────────
 
-    st    = _styles()
-    story = []
+def _english_sections(summary: dict, styles: dict) -> list:
+    story: list = []
 
-    # ── Header ────────────────────────────────────────────────────────────
-    date_str = meeting_date or datetime.now().strftime("%B %d, %Y")
-    story.append(Paragraph(title, st["title"]))
+    # Title + subtitle
+    story.append(Paragraph(summary.get("meeting_title", "Meeting Summary"),
+                           styles["Title"]))
     story.append(Paragraph(
-        f"Generated {date_str}  ·  AI Meeting Summarizer", st["subtitle"]))
-    story.append(Spacer(1, 6))
+        f"{summary.get('meeting_type', 'meeting').title()} &nbsp;•&nbsp; "
+        f"{summary.get('duration_estimate', 'Unknown duration')} &nbsp;•&nbsp; "
+        f"Sentiment: {summary.get('sentiment', 'neutral').title()}",
+        styles["Subtitle"],
+    ))
+    story.append(HRFlowable(width="100%", thickness=0.6, color=ACCENT,
+                            spaceBefore=2, spaceAfter=10))
 
-    # Meeting type + sentiment + duration badges
-    m_type   = summary.get("meeting_type", "other")
-    sentiment= summary.get("sentiment", "neutral")
-    duration = summary.get("duration_estimate", "Unknown")
-    story.append(_build_header_badges(m_type, sentiment, duration, st))
-    story.append(Spacer(1, 8))
-    story.append(HRFlowable(width="100%", thickness=2, color=BLUE, spaceAfter=10))
-
-    # ── Stats bar ─────────────────────────────────────────────────────────
-    stats = summary.get("stats", {})
-    story.append(_build_stats_bar(stats, st))
+    # Stats strip
+    story.append(_stats_strip(
+        summary.get("stats", {}),
+        attendees=len(summary.get("attendees", [])),
+    ))
     story.append(Spacer(1, 14))
 
-    # ── Attendees ─────────────────────────────────────────────────────────
-    attendees = summary.get("attendees", [])
-    if attendees:
-        story += _section("Attendees", "👥", st)
-        story.append(Paragraph(", ".join(attendees), st["body"]))
-        story.append(Spacer(1, 6))
-
-    # ── Summary ───────────────────────────────────────────────────────────
-    story += _section("Meeting Summary", "📋", st)
-    for para in summary.get("summary", "").split("\n\n"):
+    # Executive summary
+    story.append(Paragraph("Executive Summary", styles["H1"]))
+    summary_text = summary.get("summary", "No summary available.")
+    for para in summary_text.split("\n\n"):
         if para.strip():
-            story.append(Paragraph(para.strip(), st["body"]))
-    story.append(Spacer(1, 6))
+            story.append(Paragraph(para.strip(), styles["Body"]))
 
-    # ── Action Items ──────────────────────────────────────────────────────
-    action_items = summary.get("action_items", [])
-    if action_items:
-        story += _section("Action Items", "✅", st)
-        # Header row
-        header = [
-            Paragraph("Task", st["th"]),
-            Paragraph("Owner", st["th"]),
-            Paragraph("Due Date", st["th"]),
-            Paragraph("Priority", st["th"]),
-            Paragraph("Context", st["th"]),
-        ]
-        rows = [header]
-        for item in action_items:
-            rows.append([
-                Paragraph(item.get("task", ""), st["td"]),
-                Paragraph(item.get("owner", "Unassigned"), st["td"]),
-                Paragraph(item.get("due_date", "TBD"), st["td"]),
-                _priority_badge(item.get("priority", "Medium"), st["badge"]),
-                Paragraph(item.get("context", ""), st["td"]),
-            ])
-        tbl = Table(rows, colWidths=[
-            55*mm,   # task
-            30*mm,   # owner
-            25*mm,   # due date
-            20*mm,   # priority
-            CONTENT_W - 130*mm,   # context
-        ])
-        tbl.setStyle(TableStyle(_table_base_style()))
-        story.append(tbl)
-        story.append(Spacer(1, 10))
+    # Attendees
+    if summary.get("attendees"):
+        story.append(Paragraph("Attendees", styles["H1"]))
+        story.append(Paragraph(", ".join(summary["attendees"]), styles["Body"]))
 
-    # ── Decisions ─────────────────────────────────────────────────────────
-    decisions = summary.get("decisions", [])
-    if decisions:
-        story += _section("Key Decisions", "⚖️", st)
-        header = [
-            Paragraph("Decision", st["th"]),
-            Paragraph("Decided By", st["th"]),
-            Paragraph("Rationale", st["th"]),
-            Paragraph("Impact", st["th"]),
-        ]
-        rows = [header]
-        for d in decisions:
-            rows.append([
-                Paragraph(d.get("decision", ""), st["td"]),
-                Paragraph(d.get("decided_by", "—"), st["td"]),
-                Paragraph(d.get("rationale", "Not mentioned"), st["td"]),
-                Paragraph(d.get("impact", "Not mentioned"), st["td"]),
-            ])
-        tbl = Table(rows, colWidths=[
-            55*mm,
-            28*mm,
-            CONTENT_W * 0.35,
-            CONTENT_W * 0.25,
-        ])
-        tbl.setStyle(TableStyle(_table_base_style()))
-        story.append(tbl)
-        story.append(Spacer(1, 10))
-
-    # ── Open Questions / Blockers ─────────────────────────────────────────
-    questions = summary.get("open_questions", [])
-    if questions:
-        story += _section("Open Questions & Blockers", "❓", st)
-        header = [
-            Paragraph("Question / Blocker", st["th"]),
-            Paragraph("Assigned To", st["th"]),
-            Paragraph("Urgency", st["th"]),
-        ]
-        rows = [header]
-        for q in questions:
-            rows.append([
-                Paragraph(q.get("question", ""), st["td"]),
-                Paragraph(q.get("assigned_to", "Team"), st["td"]),
-                _priority_badge(q.get("urgency", "Medium"), st["badge"]),
-            ])
-        tbl = Table(rows, colWidths=[
-            CONTENT_W - 70*mm,
-            38*mm,
-            20*mm,
-        ])
-        tbl.setStyle(TableStyle(_table_base_style()))
-        story.append(tbl)
-        story.append(Spacer(1, 10))
-
-    # ── Risks ─────────────────────────────────────────────────────────────
-    risks = summary.get("risks", [])
-    if risks:
-        story += _section("Risks & Concerns", "⚠️", st)
-        header = [
-            Paragraph("Risk", st["th"]),
-            Paragraph("Likelihood", st["th"]),
-            Paragraph("Mitigation", st["th"]),
-        ]
-        rows = [header]
-        for r in risks:
-            rows.append([
-                Paragraph(r.get("risk", ""), st["td"]),
-                _likelihood_badge(r.get("likelihood", "Unknown"), st["badge"]),
-                Paragraph(r.get("mitigation", "None discussed"), st["td"]),
-            ])
-        tbl = Table(rows, colWidths=[
-            CONTENT_W * 0.38,
-            22*mm,
-            CONTENT_W * 0.45,
-        ])
-        tbl.setStyle(TableStyle(_table_base_style()))
-        story.append(tbl)
-        story.append(Spacer(1, 10))
-
-    # ── Speaker Contributions ─────────────────────────────────────────────
-    speakers = summary.get("speaker_contributions", [])
-    if speakers:
-        story += _section("Speaker Contributions", "🎙️", st)
-        for sp in speakers:
-            name = sp.get("speaker", "Unknown")
-            role = sp.get("role", "")
-            label = f"<b>{name}</b>" + (f" <i>({role})</i>" if role and role != "Unknown" else "")
-            story.append(Paragraph(label, st["body"]))
-            for pt in sp.get("key_points", []):
-                story.append(Paragraph(f"• {pt}", st["item"]))
-            owned = sp.get("items_owned", [])
-            if owned:
-                story.append(Paragraph(
-                    f"<i>Owns: {'; '.join(owned)}</i>", st["small"]))
-            story.append(Spacer(1, 4))
-        story.append(Spacer(1, 6))
-
-    # ── Next Steps ────────────────────────────────────────────────────────
-    next_steps = summary.get("next_steps", [])
-    if next_steps:
-        story += _section("Next Steps", "🚀", st)
-        for i, step in enumerate(next_steps, 1):
-            story.append(Paragraph(f"{i}. {step}", st["item"]))
-        story.append(Spacer(1, 10))
-
-    # ── Footer topics bar ─────────────────────────────────────────────────
-    topics = summary.get("key_topics", [])
-    if topics:
-        story.append(HRFlowable(width="100%", thickness=0.8,
-                                color=BORDER, spaceAfter=4))
+    # Key topics
+    if summary.get("key_topics"):
+        story.append(Paragraph("Key Topics", styles["H1"]))
         story.append(Paragraph(
-            f"<b>Key Topics:</b>  {' · '.join(topics)}",
-            ParagraphStyle("ft", fontSize=8, fontName="Helvetica",
-                           textColor=MGREY, leading=11)))
+            " &nbsp;·&nbsp; ".join(summary["key_topics"]),
+            styles["Body"],
+        ))
 
-    # ── Build ─────────────────────────────────────────────────────────────
-    doc.build(story, onFirstPage=footer, onLaterPages=footer)
-    return buffer.getvalue()
+    # Action items
+    action_table = _action_items_table(summary.get("action_items", []), styles)
+    if action_table is not None:
+        story.append(Paragraph("Action Items", styles["H1"]))
+        story.append(action_table)
+
+    # Decisions
+    if summary.get("decisions"):
+        story.append(Paragraph("Decisions Made", styles["H1"]))
+        story.extend(_decisions_block(summary["decisions"], styles))
+
+    # Open questions
+    if summary.get("open_questions"):
+        story.append(Paragraph("Open Questions", styles["H1"]))
+        for q in summary["open_questions"]:
+            story.append(Paragraph(
+                f"• {q.get('question', '')} "
+                f"<font color='#6B7280'>→ {q.get('assigned_to', 'Team')} "
+                f"({q.get('urgency', 'Medium')})</font>",
+                styles["Bullet"],
+            ))
+
+    # Risks
+    if summary.get("risks"):
+        story.append(Paragraph("Risks & Concerns", styles["H1"]))
+        story.extend(_risks_block(summary["risks"], styles))
+
+    # Next steps
+    if summary.get("next_steps"):
+        story.append(Paragraph("Next Steps", styles["H1"]))
+        story.extend(_bullet_list(summary["next_steps"], styles))
+
+    return story
+
+
+# ── Section: Urdu content ─────────────────────────────────────────────────
+
+def _urdu_sections(summary: dict, styles: dict, full_urdu: bool = False) -> list:
+    """
+    full_urdu=True  → entire report is in Urdu (output_language='urdu')
+    full_urdu=False → bilingual mirror section (output_language='both')
+    """
+    story: list = []
+
+    # Section header in English to mark the Urdu section in 'both' mode
+    if not full_urdu:
+        story.append(PageBreak())
+        story.append(Paragraph("اردو خلاصہ &nbsp;/&nbsp; Urdu Summary",
+                               styles["UrduTitle"]))
+        story.append(HRFlowable(width="100%", thickness=0.6, color=ACCENT,
+                                spaceBefore=2, spaceAfter=10))
+
+    # Title
+    title_ur = summary.get("meeting_title_ur") or summary.get("meeting_title", "")
+    if title_ur:
+        story.append(Paragraph(_shape_urdu(title_ur), styles["UrduTitle"]))
+        story.append(Spacer(1, 8))
+
+    # Summary
+    story.append(Paragraph(_shape_urdu("خلاصہ"), styles["UrduH1"]))
+    summary_ur = summary.get("summary_ur") or summary.get("summary", "")
+    for para in summary_ur.split("\n\n"):
+        if para.strip():
+            story.append(Paragraph(_shape_urdu(para.strip()), styles["UrduBody"]))
+
+    # Key topics (Urdu)
+    topics_ur = summary.get("key_topics_ur") or summary.get("key_topics", [])
+    if topics_ur:
+        story.append(Paragraph(_shape_urdu("اہم موضوعات"), styles["UrduH1"]))
+        story.append(Paragraph(
+            _shape_urdu(" · ".join(topics_ur)),
+            styles["UrduBody"],
+        ))
+
+    # Next steps (Urdu)
+    next_ur = summary.get("next_steps_ur") or summary.get("next_steps", [])
+    if next_ur:
+        story.append(Paragraph(_shape_urdu("اگلے اقدامات"), styles["UrduH1"]))
+        story.extend(_urdu_bullet_list(next_ur, styles))
+
+    # In full-Urdu mode, also render action items, decisions, etc. in Urdu
+    # (these come from the LLM already in Urdu when output_language='urdu')
+    if full_urdu:
+        if summary.get("action_items"):
+            story.append(Paragraph(_shape_urdu("ایکشن آئٹمز"), styles["UrduH1"]))
+            for item in summary["action_items"]:
+                line = f"• {item.get('task', '')} — {item.get('owner', '')}"
+                story.append(Paragraph(_shape_urdu(line), styles["UrduBullet"]))
+
+        if summary.get("decisions"):
+            story.append(Paragraph(_shape_urdu("فیصلے"), styles["UrduH1"]))
+            for d in summary["decisions"]:
+                story.append(Paragraph(_shape_urdu(f"• {d.get('decision', '')}"),
+                                       styles["UrduBullet"]))
+
+    return story
+
+
+# ── Public API ─────────────────────────────────────────────────────────────
+
+def generate_pdf(
+    summary: dict[str, Any],
+    output_path: str = "output/meeting_report.pdf",
+    transcript: str | None = None,
+) -> str:
+    """
+    Generate a PDF report from a structured summary dict.
+
+    Args:
+        summary:     Dict from summarizer.summarize_transcript().
+        output_path: Where to write the PDF.
+        transcript:  Optional — full raw transcript appended at the end.
+
+    Returns:
+        Absolute path to the generated PDF.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    # Determine layout language from summary metadata
+    output_language = summary.get("_output_language", "english")
+
+    # Register Urdu font if we'll need it
+    if output_language in ("urdu", "both") or _has_urdu_chars(summary.get("summary", "")):
+        _register_urdu_font()
+
+    styles = _build_styles()
+
+    # Set up document with custom page template
+    doc = BaseDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=2 * cm, rightMargin=2 * cm,
+        topMargin=2 * cm, bottomMargin=2 * cm,
+        title=summary.get("meeting_title", "Meeting Summary"),
+        author="Meeting Summarizer",
+    )
+    frame = Frame(doc.leftMargin, doc.bottomMargin,
+                  doc.width, doc.height, id="main")
+    doc.addPageTemplates([PageTemplate(id="default", frames=frame,
+                                       onPage=_draw_page_chrome)])
+
+    # Build story
+    story: list = []
+
+    if output_language == "urdu":
+        # Full Urdu report
+        story.extend(_urdu_sections(summary, styles, full_urdu=True))
+    elif output_language == "both":
+        # English first, then Urdu mirror
+        story.extend(_english_sections(summary, styles))
+        story.extend(_urdu_sections(summary, styles, full_urdu=False))
+    else:
+        # English only (default)
+        story.extend(_english_sections(summary, styles))
+
+    # Optional: appendix with raw transcript
+    if transcript:
+        story.append(PageBreak())
+        story.append(Paragraph("Appendix: Full Transcript", styles["H1"]))
+        story.append(HRFlowable(width="100%", thickness=0.4, color=MUTED,
+                                spaceBefore=2, spaceAfter=10))
+        # Render in chunks to avoid one giant paragraph
+        for chunk in transcript.split("\n\n"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if _has_urdu_chars(chunk):
+                _register_urdu_font()
+                story.append(Paragraph(_shape_urdu(chunk), styles["UrduBody"]))
+            else:
+                story.append(Paragraph(chunk, styles["Body"]))
+
+    # Render
+    doc.build(story)
+    print(f"[pdf] Report written to: {output_path}")
+    return os.path.abspath(output_path)
+
+
+# ── Backward-compat alias ─────────────────────────────────────────────────
+
+def generate_report(*args, **kwargs):
+    """Alias for older call sites."""
+    return generate_pdf(*args, **kwargs)
